@@ -19,9 +19,17 @@
         <div class="term-divider" data-tail="──────────">WhatsApp 登录入口</div>
         <h2 class="wa-title">扫码登录 WhatsApp Web<span class="term-cursor"></span></h2>
         <p class="wa-sub">
-          这里是前端唯一的 WhatsApp 登录入口。扫码连接后，后台 sidecar 会自动监听 WhatsApp 消息，
-          提取 GoPay OTP，并写入支付流程固定读取的本地文件。
+          这里是前端唯一的 WhatsApp 登录入口。你可以在启动前自由切换 Baileys / whatsapp-web.js；
+          扫码连接后，后台 sidecar 会自动监听 WhatsApp 消息，提取 GoPay OTP，并写入支付流程固定读取的本地文件。
         </p>
+
+        <div class="engine-row">
+          <TermSelect
+            v-model="selectedEngine"
+            label="引擎 · engine"
+            :options="engineOptions"
+          />
+        </div>
 
         <div class="status-card" :class="connectClass">
           <span class="status-dot">●</span>
@@ -31,7 +39,7 @@
 
         <div class="wa-actions">
           <TermBtn :loading="starting" @click="startQr">
-            {{ status.running ? "刷新登录状态" : "启动 WhatsApp 登录" }}
+            {{ startButtonLabel }}
           </TermBtn>
           <TermBtn v-if="status.running" variant="danger" @click="stop">停止 sidecar</TermBtn>
           <TermBtn variant="danger" :loading="loggingOut" @click="logoutWa">退出 WhatsApp 登录</TermBtn>
@@ -50,6 +58,12 @@
         </div>
         <div v-else class="empty-box">
           点击“启动 WhatsApp 登录”后，这里会显示二维码。
+        </div>
+
+        <div v-if="status.engine || status.preferred_engine" class="engine-box">
+          <span class="engine-label">当前引擎</span>
+          <code>{{ status.engine || status.preferred_engine }}</code>
+          <span class="engine-meta">偏好：{{ status.preferred_engine || "baileys" }}</span>
         </div>
 
         <div v-if="status.latest?.otp" class="latest-box">
@@ -73,11 +87,14 @@ import { RouterLink, useRouter } from "vue-router";
 import { useMessage } from "naive-ui";
 import { api } from "../api/client";
 import TermBtn from "../components/term/TermBtn.vue";
+import TermSelect from "../components/term/TermSelect.vue";
 
 interface WaStatus {
   running: boolean;
   pid: number | null;
   mode: string;
+  engine?: string;
+  preferred_engine?: string;
   started_at: number | null;
   status: string;
   qr_data_url?: string | null;
@@ -106,6 +123,11 @@ const status = ref<WaStatus>({
 });
 const starting = ref(false);
 const loggingOut = ref(false);
+const selectedEngine = ref(localStorage.getItem("webui_wa_engine") || "baileys");
+const engineOptions = [
+  { value: "baileys", label: "Baileys (推荐)", desc: "直连 WhatsApp multi-device socket，启动更轻" },
+  { value: "wwebjs", label: "whatsapp-web.js", desc: "Chromium 路径，兼容旧环境 / 调试用" },
+];
 const clock = ref("");
 let clockTimer: ReturnType<typeof setInterval> | undefined;
 let pollTimer: ReturnType<typeof setInterval> | undefined;
@@ -139,6 +161,13 @@ const connectClass = computed(() => {
   }
 });
 
+const startButtonLabel = computed(() => {
+  const engine = selectedEngine.value || "baileys";
+  if (status.value.running && status.value.engine === engine) return "刷新登录状态";
+  if (status.value.running) return `切换到 ${engine} 并重启`;
+  return `启动 ${engine}`;
+});
+
 const statusJson = computed(() => JSON.stringify(status.value, null, 2));
 
 function tick() {
@@ -150,6 +179,9 @@ async function refresh() {
   try {
     const r = await api.get("/whatsapp/status");
     status.value = r.data;
+    if (!localStorage.getItem("webui_wa_engine") && r.data?.preferred_engine) {
+      selectedEngine.value = r.data.preferred_engine;
+    }
   } catch {
     // polling only; ignore transient errors
   }
@@ -158,7 +190,8 @@ async function refresh() {
 async function startQr() {
   starting.value = true;
   try {
-    await api.post("/whatsapp/start", { mode: "qr" });
+    localStorage.setItem("webui_wa_engine", selectedEngine.value || "baileys");
+    await api.post("/whatsapp/start", { mode: "qr", engine: selectedEngine.value || "baileys" });
     await refresh();
   } catch (e: any) {
     message.error(e.response?.data?.detail || "启动失败");
@@ -197,6 +230,17 @@ async function logout() {
 onMounted(async () => {
   tick();
   clockTimer = setInterval(tick, 1000);
+  if (!localStorage.getItem("webui_wa_engine")) {
+    try {
+      const wizard = await api.get("/wizard/state");
+      const engine = wizard.data?.answers?.gopay?.whatsapp_engine;
+      if (engine === "baileys" || engine === "wwebjs") {
+        selectedEngine.value = engine;
+      }
+    } catch {
+      // ignore
+    }
+  }
   await refresh();
   pollTimer = setInterval(refresh, 1500);
 });
@@ -253,6 +297,7 @@ onBeforeUnmount(() => {
 .status-card.err { border-color: var(--err); color: var(--err); }
 .status-card.idle { color: var(--fg-tertiary); }
 .status-meta { margin-left: auto; color: var(--fg-tertiary); font-size: 12px; }
+.engine-row { margin-top: 18px; }
 .wa-actions { display: flex; flex-wrap: wrap; gap: 10px; margin-bottom: 22px; }
 .qr-box, .empty-box, .connected-box {
   border: 1px dashed var(--border);
@@ -266,6 +311,18 @@ onBeforeUnmount(() => {
   padding: 12px;
 }
 .qr-box p, .empty-box, .connected-box p { color: var(--fg-tertiary); font-size: 13px; }
+.engine-box {
+  margin-top: 18px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  border: 1px solid var(--border);
+  background: var(--bg-base);
+  padding: 10px 12px;
+  font-size: 12px;
+}
+.engine-label { color: var(--fg-tertiary); }
+.engine-meta { margin-left: auto; color: var(--fg-tertiary); }
 .connected-box {
   display: flex;
   align-items: center;

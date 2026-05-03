@@ -188,11 +188,12 @@ WebUI GoPay 配置页只显示一个入口：
 WhatsApp 登录 / 扫码接收 GoPay OTP
 ```
 
-点击后进入 `/whatsapp`，扫码登录 WhatsApp。后台 sidecar 默认使用
-Baileys（`@whiskeysockets/baileys`）直接监听 WhatsApp multi-device
-socket；如需回退到旧的 `whatsapp-web.js`/Chromium 路径，可设置
-`WEBUI_WA_ENGINE=wwebjs` 后重启 WebUI。sidecar 会监听新消息，提取
-GoPay OTP，并写入：
+点击后进入 `/whatsapp`，扫码登录 WhatsApp。登录页可以自由选择
+`baileys` 或 `wwebjs` 引擎：默认推荐 Baileys（`@whiskeysockets/baileys`）
+直接监听 WhatsApp multi-device socket；如需回退到旧的
+`whatsapp-web.js`/Chromium 路径，在页面下拉选择 `whatsapp-web.js`
+并重启 sidecar 即可。`WEBUI_WA_ENGINE=wwebjs` 仍可作为首次启动默认值。
+sidecar 会监听新消息，提取 GoPay OTP，并写入：
 
 ```text
 output/wa_otp.txt

@@ -25,16 +25,46 @@ def test_whatsapp_start_calls_relay(client, monkeypatch):
     from webui.backend import wa_relay
     calls = []
 
-    def fake_start(mode="qr", pairing_phone=""):
-        calls.append((mode, pairing_phone))
+    def fake_start(mode="qr", pairing_phone="", engine=""):
+        calls.append((mode, pairing_phone, engine))
         return {"running": True, "status": "awaiting_qr_scan"}
 
     monkeypatch.setattr(wa_relay, "start", fake_start)
 
-    r = client.post("/api/whatsapp/start", json={"mode": "qr"})
+    r = client.post("/api/whatsapp/start", json={"mode": "qr", "engine": "wwebjs"})
     assert r.status_code == 200
     assert r.json()["running"] is True
-    assert calls == [("qr", "")]
+    assert calls == [("qr", "", "wwebjs")]
+
+
+def test_whatsapp_start_rejects_bad_engine(client):
+    _login(client)
+
+    r = client.post("/api/whatsapp/start", json={"mode": "qr", "engine": "nope"})
+    assert r.status_code == 400
+    assert "engine must be baileys or wwebjs" in r.json()["detail"]
+
+
+def test_whatsapp_engine_aliases():
+    from webui.backend import wa_relay
+
+    assert wa_relay._normalize_engine("baileys") == "baileys"
+    assert wa_relay._normalize_engine("wwebjs") == "wwebjs"
+    assert wa_relay._normalize_engine("whatsapp-web.js") == "wwebjs"
+
+
+def test_whatsapp_preferred_engine_persists(client, tmp_path, monkeypatch):
+    _login(client)
+
+    from webui.backend import wa_relay
+
+    monkeypatch.setenv("WEBUI_DATA_DIR", str(tmp_path))
+    wa_relay._write_preferred_engine("wwebjs")
+
+    assert wa_relay._read_preferred_engine() == "wwebjs"
+    status = wa_relay.status()
+    assert status["preferred_engine"] == "wwebjs"
+    assert status["engine"] == "wwebjs"
 
 
 def test_whatsapp_start_error_returns_400(client, monkeypatch):

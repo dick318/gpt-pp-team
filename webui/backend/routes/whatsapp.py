@@ -14,6 +14,7 @@ router = APIRouter(prefix="/api/whatsapp", tags=["whatsapp"])
 class StartRequest(BaseModel):
     mode: str = Field(pattern="^(qr|pairing)$", default="qr")
     phone: str = ""
+    engine: str = ""
 
 
 @router.get("/status")
@@ -24,7 +25,7 @@ def get_status(user: str = CurrentUser):
 @router.post("/start")
 def start(req: StartRequest, user: str = CurrentUser):
     try:
-        return wa_relay.start(mode=req.mode, pairing_phone=req.phone)
+        return wa_relay.start(mode=req.mode, pairing_phone=req.phone, engine=req.engine)
     except (ValueError, RuntimeError) as e:
         raise HTTPException(status_code=400, detail=str(e))
 

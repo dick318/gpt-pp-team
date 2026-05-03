@@ -24,7 +24,23 @@ from . import settings as s
 _lock = threading.Lock()
 _proc: Optional[subprocess.Popen] = None
 _mode: str = ""
+_engine: str = ""
 _started_at: Optional[float] = None
+
+
+def _normalize_engine(engine: str = "", *, _from_env: bool = False) -> str:
+    raw = (engine or "").strip().lower().replace("_", "-")
+    if raw in ("", "default"):
+        if _from_env:
+            return "baileys"
+        return _normalize_engine(os.environ.get("WEBUI_WA_ENGINE", "baileys"), _from_env=True)
+    if raw in ("baileys",):
+        return "baileys"
+    if raw in ("wwebjs", "whatsapp-web.js", "whatsapp-web-js", "whatsappwebjs"):
+        return "wwebjs"
+    if _from_env:
+        return "baileys"
+    raise ValueError(f"engine must be baileys or wwebjs, got {engine!r}")
 
 
 def _data_dir() -> Path:
@@ -35,6 +51,10 @@ def _data_dir() -> Path:
 
 def _state_path() -> Path:
     return _data_dir() / "wa_state.json"
+
+
+def _settings_path() -> Path:
+    return _data_dir() / "wa_settings.json"
 
 
 def _otp_path() -> Path:
@@ -52,6 +72,25 @@ def otp_path() -> Path:
     return _otp_path()
 
 
+def _read_preferred_engine() -> str:
+    p = _settings_path()
+    if p.exists():
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                return _normalize_engine(str(data.get("engine") or ""))
+        except Exception:
+            pass
+    return _normalize_engine(os.environ.get("WEBUI_WA_ENGINE", "baileys"), _from_env=True)
+
+
+def _write_preferred_engine(engine: str) -> None:
+    engine = _normalize_engine(engine)
+    p = _settings_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps({"engine": engine}, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
 def is_running() -> bool:
     return _proc is not None and _proc.poll() is None
 
@@ -64,10 +103,13 @@ def status() -> dict:
     stale `connected` state as live.
     """
     running = is_running()
+    preferred_engine = _read_preferred_engine()
     base = {
         "running": running,
         "pid": _proc.pid if running and _proc else None,
         "mode": _mode,
+        "engine": _engine if running and _engine else preferred_engine,
+        "preferred_engine": preferred_engine,
         "started_at": _started_at,
         "otp_path": str(_otp_path()),
         "state_path": str(_state_path()),
@@ -83,6 +125,7 @@ def status() -> dict:
 
     if not running:
         base["status"] = "stopped"
+        base["engine"] = preferred_engine
         for key in ("qr", "qr_data_url", "qr_ascii", "code"):
             base.pop(key, None)
     elif "status" not in base:
@@ -90,15 +133,16 @@ def status() -> dict:
     return base
 
 
-def start(mode: str = "qr", pairing_phone: str = "") -> dict:
+def start(mode: str = "qr", pairing_phone: str = "", engine: str = "") -> dict:
     """Spawn the Node sidecar in QR mode.
 
     `pairing` mode is kept at the API level for compatibility, but the WebUI now
     exposes only the QR WhatsApp login entry.
     """
-    global _proc, _mode, _started_at
+    global _proc, _mode, _engine, _started_at
 
     mode = (mode or "qr").lower()
+    engine = _normalize_engine(engine or _read_preferred_engine())
     if mode not in ("qr", "pairing"):
         raise ValueError(f"mode must be qr or pairing, got {mode!r}")
     if mode == "pairing":
@@ -108,7 +152,9 @@ def start(mode: str = "qr", pairing_phone: str = "") -> dict:
         pairing_phone = digits
 
     with _lock:
-        if is_running() and _mode == mode:
+        _write_preferred_engine(engine)
+
+        if is_running() and _mode == mode and _engine == engine:
             return status()
 
         _stop_locked()
@@ -132,8 +178,9 @@ def start(mode: str = "qr", pairing_phone: str = "") -> dict:
             **os.environ,
             # Baileys listens on the raw WhatsApp multi-device socket and is
             # more suitable for OTP capture than DOM scraping via Chromium.
-            # Set WEBUI_WA_ENGINE=wwebjs to fall back to whatsapp-web.js.
-            "WA_ENGINE": os.environ.get("WEBUI_WA_ENGINE", "baileys"),
+            # The WebUI can switch this per start request; WEBUI_WA_ENGINE only
+            # acts as the initial default.
+            "WA_ENGINE": engine,
             "WA_LOGIN_MODE": mode,
             "WA_STATE_FILE": str(_state_path()),
             "WA_OTP_FILE": str(_otp_path()),
@@ -160,6 +207,7 @@ def start(mode: str = "qr", pairing_phone: str = "") -> dict:
 
         _proc = proc
         _mode = mode
+        _engine = engine
         _started_at = time.time()
 
         # Give the sidecar a short window to fail fast (missing browser, bad
@@ -169,6 +217,7 @@ def start(mode: str = "qr", pairing_phone: str = "") -> dict:
             if proc.poll() is not None:
                 _proc = None
                 _mode = ""
+                _engine = ""
                 _started_at = None
                 detail = ""
                 try:
@@ -215,7 +264,7 @@ def _purge_stale_chrome(session_dir: Path) -> None:
 
 
 def _stop_locked() -> None:
-    global _proc, _mode, _started_at
+    global _proc, _mode, _engine, _started_at
 
     proc = _proc
     if proc is None:
@@ -238,6 +287,7 @@ def _stop_locked() -> None:
             proc.wait()
     _proc = None
     _mode = ""
+    _engine = ""
     _started_at = None
 
 
