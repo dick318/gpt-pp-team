@@ -2,23 +2,29 @@
 
 The WebUI exposes one user-facing "WhatsApp 登录" entry. Behind it, this module
 manages a single Node sidecar (`webui/whatsapp_relay/index.js`) that logs in to
-WhatsApp Web, watches incoming messages, extracts GoPay OTPs, and writes them to
-`output/wa_otp.txt` for `gopay.py` to consume via the configured file provider.
+WhatsApp Web, watches incoming messages, extracts GoPay OTPs, and writes all
+application state/OTP data into SQLite (`runtime_meta`). The only remaining
+filesystem state is the WhatsApp client auth/session cache required by the
+upstream WhatsApp libraries and the plain process log.
 """
 from __future__ import annotations
 
+import base64
+import io
 import glob
-import json
 import os
+import secrets
 import shutil
 import signal
 import subprocess
 import threading
 import time
+import tarfile
 from pathlib import Path
 from typing import Optional
 
 from . import settings as s
+from .db import get_db
 
 
 _lock = threading.Lock()
@@ -26,6 +32,11 @@ _proc: Optional[subprocess.Popen] = None
 _mode: str = ""
 _engine: str = ""
 _started_at: Optional[float] = None
+
+_STATE_KEY = "wa_state"
+_SETTINGS_KEY = "wa_settings"
+_TOKEN_KEY = "wa_relay_token"
+_SESSION_SNAPSHOT_KEY = "wa_session_snapshot"
 
 
 def _normalize_engine(engine: str = "", *, _from_env: bool = False) -> str:
@@ -49,46 +60,147 @@ def _data_dir() -> Path:
     return d
 
 
-def _state_path() -> Path:
-    return _data_dir() / "wa_state.json"
-
-
-def _settings_path() -> Path:
-    return _data_dir() / "wa_settings.json"
-
-
-def _otp_path() -> Path:
-    return _data_dir() / "wa_otp.txt"
-
-
-def _session_dir() -> Path:
+def _session_dir(*, create: bool = True) -> Path:
     p = _data_dir() / "wa_session"
-    p.mkdir(parents=True, exist_ok=True)
+    if create:
+        p.mkdir(parents=True, exist_ok=True)
     return p
 
 
-def otp_path() -> Path:
-    """Path that gopay.py should poll for relay-fed WhatsApp OTPs."""
-    return _otp_path()
+def _session_snapshot_path() -> Path:
+    return _session_dir(create=False)
+
+
+def _safe_extract_tar(tar: tarfile.TarFile, dest: Path) -> None:
+    dest = dest.resolve()
+    for member in tar.getmembers():
+        target = (dest / member.name).resolve()
+        if dest not in target.parents and target != dest:
+            raise RuntimeError(f"unsafe session snapshot entry: {member.name}")
+    try:
+        tar.extractall(dest, filter="data")
+    except TypeError:
+        tar.extractall(dest)
+
+
+def _read_session_snapshot() -> dict:
+    data = get_db().get_runtime_json(_SESSION_SNAPSHOT_KEY, {})
+    return data if isinstance(data, dict) else {}
+
+
+def _write_session_snapshot(payload: dict) -> None:
+    if payload:
+        get_db().set_runtime_json(_SESSION_SNAPSHOT_KEY, payload)
+    else:
+        get_db().delete_runtime_key(_SESSION_SNAPSHOT_KEY)
+
+
+def _snapshot_session_dir() -> None:
+    session_dir = _session_snapshot_path()
+    if not session_dir.exists():
+        _write_session_snapshot({})
+        return
+    entries = [p for p in session_dir.rglob("*") if p.is_file() and not p.is_symlink()]
+    if not entries:
+        _write_session_snapshot({})
+        return
+    bio = io.BytesIO()
+    with tarfile.open(fileobj=bio, mode="w:gz") as tar:
+        for p in entries:
+            tar.add(p, arcname=str(p.relative_to(session_dir)))
+    _write_session_snapshot({
+        "format": "tar.gz+base64",
+        "engine": _read_preferred_engine(),
+        "updated_at": time.time(),
+        "data": base64.b64encode(bio.getvalue()).decode("ascii"),
+    })
+
+
+def _restore_session_snapshot() -> bool:
+    payload = _read_session_snapshot()
+    data = str(payload.get("data") or "")
+    if not data:
+        return False
+    try:
+        raw = base64.b64decode(data.encode("ascii"))
+    except Exception:
+        return False
+    session_dir = _session_dir(create=True)
+    try:
+        if session_dir.exists():
+            shutil.rmtree(session_dir, ignore_errors=True)
+        session_dir.mkdir(parents=True, exist_ok=True)
+        with tarfile.open(fileobj=io.BytesIO(raw), mode="r:gz") as tar:
+            _safe_extract_tar(tar, session_dir)
+        return True
+    except Exception:
+        shutil.rmtree(session_dir, ignore_errors=True)
+        session_dir.mkdir(parents=True, exist_ok=True)
+        return False
+
+
+def _persist_session_snapshot() -> None:
+    _snapshot_session_dir()
+    session_dir = _session_snapshot_path()
+    if session_dir.exists():
+        shutil.rmtree(session_dir, ignore_errors=True)
+
+
+def _clear_session_snapshot() -> None:
+    _write_session_snapshot({})
+    session_dir = _session_snapshot_path()
+    if session_dir.exists():
+        shutil.rmtree(session_dir, ignore_errors=True)
+
+
+def _read_state() -> dict:
+    data = get_db().get_runtime_json(_STATE_KEY, {})
+    return data if isinstance(data, dict) else {}
+
+
+def _write_state(data: dict) -> None:
+    get_db().set_runtime_json(_STATE_KEY, data if isinstance(data, dict) else {})
 
 
 def _read_preferred_engine() -> str:
-    p = _settings_path()
-    if p.exists():
+    data = get_db().get_runtime_json(_SETTINGS_KEY, {})
+    if isinstance(data, dict):
         try:
-            data = json.loads(p.read_text(encoding="utf-8"))
-            if isinstance(data, dict):
-                return _normalize_engine(str(data.get("engine") or ""))
+            return _normalize_engine(str(data.get("engine") or ""))
         except Exception:
             pass
     return _normalize_engine(os.environ.get("WEBUI_WA_ENGINE", "baileys"), _from_env=True)
 
 
 def _write_preferred_engine(engine: str) -> None:
-    engine = _normalize_engine(engine)
-    p = _settings_path()
-    p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps({"engine": engine}, ensure_ascii=False, indent=2), encoding="utf-8")
+    get_db().set_runtime_json(_SETTINGS_KEY, {"engine": _normalize_engine(engine)})
+
+
+def set_preferred_engine(engine: str) -> dict:
+    """Persist the preferred WhatsApp engine in SQLite.
+
+    This replaces the old browser-local preference (`localStorage`) so the
+    engine selector is consistent across browsers / nginx sessions and remains
+    part of the server-side runtime database.
+    """
+    normalized = _normalize_engine(engine)
+    _write_preferred_engine(normalized)
+    st = status()
+    st["preferred_engine"] = normalized
+    return st
+
+
+def relay_token() -> str:
+    token = get_db().get_runtime_value(_TOKEN_KEY, "")
+    if not token:
+        token = secrets.token_urlsafe(32)
+        get_db().set_runtime_value(_TOKEN_KEY, token)
+    return token
+
+
+def otp_url() -> str:
+    base = os.environ.get("WEBUI_INTERNAL_BASE_URL", "http://127.0.0.1:8765").rstrip("/")
+    return f"{base}/api/whatsapp/latest-otp?token={relay_token()}"
 
 
 def is_running() -> bool:
@@ -96,11 +208,10 @@ def is_running() -> bool:
 
 
 def status() -> dict:
-    """Read state file written by the Node sidecar.
+    """Read state from SQLite.
 
-    The state file may be stale (e.g. WebUI restarted, relay died). When the
-    sidecar is not running, force status to `stopped` so callers do not treat a
-    stale `connected` state as live.
+    When the sidecar is not running, force status to `stopped` so callers do
+    not treat stale `connected` state as live.
     """
     running = is_running()
     preferred_engine = _read_preferred_engine()
@@ -111,17 +222,17 @@ def status() -> dict:
         "engine": _engine if running and _engine else preferred_engine,
         "preferred_engine": preferred_engine,
         "started_at": _started_at,
-        "otp_path": str(_otp_path()),
-        "state_path": str(_state_path()),
+        "state_store": "sqlite",
+        "database": str(get_db().path),
+        "otp_source": "sqlite_http",
+        "otp_url_configured": bool(get_db().get_runtime_value(_TOKEN_KEY, "")),
+        "session_store": "sqlite_snapshot",
+        "session_snapshot_configured": get_db().has_runtime_key(_SESSION_SNAPSHOT_KEY),
+        "session_dir": str(_session_dir(create=False)),
     }
-    sp = _state_path()
-    if sp.exists():
-        try:
-            loaded = json.loads(sp.read_text(encoding="utf-8"))
-            if isinstance(loaded, dict):
-                base.update(loaded)
-        except Exception as e:
-            base["state_read_error"] = str(e)
+    loaded = _read_state()
+    if loaded:
+        base.update(loaded)
 
     if not running:
         base["status"] = "stopped"
@@ -131,6 +242,54 @@ def status() -> dict:
     elif "status" not in base:
         base["status"] = "starting"
     return base
+
+
+def apply_sidecar_state(payload: dict) -> dict:
+    if not isinstance(payload, dict):
+        payload = {}
+    state = _read_state()
+    state.update(payload)
+    state["updated_at"] = time.time()
+    _write_state(state)
+    return state
+
+
+def submit_manual_otp(value: str) -> dict:
+    code = "".join(ch for ch in str(value or "") if ch.isdigit())
+    if not code:
+        raise ValueError("OTP 为空")
+    item = {
+        "otp": code,
+        "ts": time.time(),
+        "from": "webui_manual",
+        "source": "manual_webui",
+        "engine": _engine or _read_preferred_engine(),
+        "text": "",
+    }
+    state = _read_state()
+    history = state.get("history") if isinstance(state.get("history"), list) else []
+    history.append(item)
+    state.update({
+        "status": "connected" if is_running() else state.get("status", "manual"),
+        "latest": item,
+        "history": history[-50:],
+        "updated_at": time.time(),
+    })
+    _write_state(state)
+    return item
+
+
+def latest_otp(since: float = 0.0) -> dict | None:
+    latest = (_read_state().get("latest") or {})
+    if not isinstance(latest, dict) or not latest.get("otp"):
+        return None
+    try:
+        ts = float(latest.get("ts") or 0.0)
+    except Exception:
+        ts = 0.0
+    if since and ts < since:
+        return None
+    return latest
 
 
 def start(mode: str = "qr", pairing_phone: str = "", engine: str = "") -> dict:
@@ -158,7 +317,12 @@ def start(mode: str = "qr", pairing_phone: str = "", engine: str = "") -> dict:
             return status()
 
         _stop_locked()
-        _purge_stale_chrome(_session_dir())
+        session_dir = _session_dir(create=True)
+        _purge_stale_chrome(session_dir)
+        if session_dir.exists():
+            shutil.rmtree(session_dir, ignore_errors=True)
+        session_dir.mkdir(parents=True, exist_ok=True)
+        _restore_session_snapshot()
 
         relay_dir = s.WA_RELAY_DIR
         index_js = relay_dir / "index.js"
@@ -168,12 +332,10 @@ def start(mode: str = "qr", pairing_phone: str = "", engine: str = "") -> dict:
         if not node_modules.exists():
             raise RuntimeError(f"未安装 sidecar 依赖；先跑 `cd {relay_dir} && npm install`")
 
-        for path in (_state_path(), _otp_path()):
-            try:
-                path.unlink()
-            except FileNotFoundError:
-                pass
+        get_db().delete_runtime_key(_STATE_KEY)
 
+        token = relay_token()
+        internal_base = os.environ.get("WEBUI_INTERNAL_BASE_URL", "http://127.0.0.1:8765").rstrip("/")
         env = {
             **os.environ,
             # Baileys listens on the raw WhatsApp multi-device socket and is
@@ -182,8 +344,8 @@ def start(mode: str = "qr", pairing_phone: str = "", engine: str = "") -> dict:
             # acts as the initial default.
             "WA_ENGINE": engine,
             "WA_LOGIN_MODE": mode,
-            "WA_STATE_FILE": str(_state_path()),
-            "WA_OTP_FILE": str(_otp_path()),
+            "WA_STATE_URL": f"{internal_base}/api/whatsapp/sidecar/state",
+            "WA_RELAY_TOKEN": token,
             "WA_SESSION_DIR": str(_session_dir()),
             "WA_HEADLESS": "1",
         }
@@ -225,7 +387,7 @@ def start(mode: str = "qr", pairing_phone: str = "", engine: str = "") -> dict:
                 except Exception:
                     pass
                 raise RuntimeError(f"WhatsApp relay 启动后退出: rc={proc.returncode} {detail}")
-            if _state_path().exists():
+            if _read_state():
                 break
             time.sleep(0.1)
         return status()
@@ -289,6 +451,7 @@ def _stop_locked() -> None:
     _mode = ""
     _engine = ""
     _started_at = None
+    _persist_session_snapshot()
 
 
 def stop() -> dict:
@@ -301,14 +464,8 @@ def logout() -> dict:
     """Stop sidecar and remove WhatsApp session so the next start shows QR."""
     with _lock:
         _stop_locked()
-        sd = _session_dir()
+        sd = _session_dir(create=False)
         _purge_stale_chrome(sd)
-        if sd.exists():
-            shutil.rmtree(sd, ignore_errors=True)
-        sd.mkdir(parents=True, exist_ok=True)
-        for path in (_state_path(), _otp_path()):
-            try:
-                path.unlink()
-            except FileNotFoundError:
-                pass
+        _clear_session_snapshot()
+        get_db().delete_runtime_key(_STATE_KEY)
     return {"status": "logged_out"}

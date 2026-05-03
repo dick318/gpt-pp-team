@@ -20,14 +20,15 @@
         <h2 class="wa-title">扫码登录 WhatsApp Web<span class="term-cursor"></span></h2>
         <p class="wa-sub">
           这里是前端唯一的 WhatsApp 登录入口。你可以在启动前自由切换 Baileys / whatsapp-web.js；
-          扫码连接后，后台 sidecar 会自动监听 WhatsApp 消息，提取 GoPay OTP，并写入支付流程固定读取的本地文件。
+          扫码连接后，后台 sidecar 会自动监听 WhatsApp 消息，提取 GoPay OTP，并写入 SQLite 运行时库供支付流程读取。
         </p>
 
         <div class="engine-row">
           <TermSelect
-            v-model="selectedEngine"
+            :model-value="selectedEngine"
             label="引擎 · engine"
             :options="engineOptions"
+            @update:modelValue="onEngineChange"
           />
         </div>
 
@@ -53,7 +54,7 @@
           <div class="ok-mark">✓</div>
           <div>
             <strong>WhatsApp 已连接</strong>
-            <p>收到 GoPay OTP 后会自动写入：<code>{{ status.otp_path }}</code></p>
+            <p>收到 GoPay OTP 后会自动写入 SQLite：<code>{{ status.database || "output/webui.db" }}</code></p>
           </div>
         </div>
         <div v-else class="empty-box">
@@ -64,6 +65,7 @@
           <span class="engine-label">当前引擎</span>
           <code>{{ status.engine || status.preferred_engine }}</code>
           <span class="engine-meta">偏好：{{ status.preferred_engine || "baileys" }}</span>
+          <span v-if="savingEngine" class="engine-saving">保存中…</span>
         </div>
 
         <div v-if="status.latest?.otp" class="latest-box">
@@ -103,7 +105,8 @@ interface WaStatus {
   message?: string;
   reason?: string;
   error?: string;
-  otp_path?: string;
+  database?: string;
+  otp_source?: string;
   latest?: {
     otp?: string;
     text?: string;
@@ -123,7 +126,8 @@ const status = ref<WaStatus>({
 });
 const starting = ref(false);
 const loggingOut = ref(false);
-const selectedEngine = ref(localStorage.getItem("webui_wa_engine") || "baileys");
+const savingEngine = ref(false);
+const selectedEngine = ref("baileys");
 const engineOptions = [
   { value: "baileys", label: "Baileys (推荐)", desc: "直连 WhatsApp multi-device socket，启动更轻" },
   { value: "wwebjs", label: "whatsapp-web.js", desc: "Chromium 路径，兼容旧环境 / 调试用" },
@@ -131,6 +135,7 @@ const engineOptions = [
 const clock = ref("");
 let clockTimer: ReturnType<typeof setInterval> | undefined;
 let pollTimer: ReturnType<typeof setInterval> | undefined;
+let preferredEngineHydrated = false;
 
 const statusLabel = computed(() => {
   switch (status.value.status) {
@@ -175,22 +180,36 @@ function tick() {
   clock.value = `${String(d.getHours()).padStart(2,'0')}:${String(d.getMinutes()).padStart(2,'0')}:${String(d.getSeconds()).padStart(2,'0')}`;
 }
 
-async function refresh() {
+async function refresh(syncPreferredEngine = false) {
   try {
     const r = await api.get("/whatsapp/status");
     status.value = r.data;
-    if (!localStorage.getItem("webui_wa_engine") && r.data?.preferred_engine) {
+    if (syncPreferredEngine && !preferredEngineHydrated && r.data?.preferred_engine) {
       selectedEngine.value = r.data.preferred_engine;
+      preferredEngineHydrated = true;
     }
   } catch {
     // polling only; ignore transient errors
   }
 }
 
+async function onEngineChange(engine: string) {
+  const next = engine || "baileys";
+  savingEngine.value = true;
+  try {
+    const r = await api.post("/whatsapp/settings", { engine: next });
+    status.value = r.data;
+    selectedEngine.value = r.data?.preferred_engine || next;
+  } catch (e: any) {
+    message.error(e.response?.data?.detail || "保存引擎偏好失败");
+  } finally {
+    savingEngine.value = false;
+  }
+}
+
 async function startQr() {
   starting.value = true;
   try {
-    localStorage.setItem("webui_wa_engine", selectedEngine.value || "baileys");
     await api.post("/whatsapp/start", { mode: "qr", engine: selectedEngine.value || "baileys" });
     await refresh();
   } catch (e: any) {
@@ -230,19 +249,11 @@ async function logout() {
 onMounted(async () => {
   tick();
   clockTimer = setInterval(tick, 1000);
-  if (!localStorage.getItem("webui_wa_engine")) {
-    try {
-      const wizard = await api.get("/wizard/state");
-      const engine = wizard.data?.answers?.gopay?.whatsapp_engine;
-      if (engine === "baileys" || engine === "wwebjs") {
-        selectedEngine.value = engine;
-      }
-    } catch {
-      // ignore
-    }
-  }
-  await refresh();
-  pollTimer = setInterval(refresh, 1500);
+  await refresh(true);
+  pollTimer = setInterval(() => {
+    refresh(false);
+  }, 1500);
+  preferredEngineHydrated = true;
 });
 
 onBeforeUnmount(() => {
@@ -323,6 +334,7 @@ onBeforeUnmount(() => {
 }
 .engine-label { color: var(--fg-tertiary); }
 .engine-meta { margin-left: auto; color: var(--fg-tertiary); }
+.engine-saving { color: var(--fg-tertiary); }
 .connected-box {
   display: flex;
   align-items: center;

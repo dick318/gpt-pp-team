@@ -59,12 +59,47 @@ def test_whatsapp_preferred_engine_persists(client, tmp_path, monkeypatch):
     from webui.backend import wa_relay
 
     monkeypatch.setenv("WEBUI_DATA_DIR", str(tmp_path))
-    wa_relay._write_preferred_engine("wwebjs")
+    wa_relay.set_preferred_engine("wwebjs")
 
     assert wa_relay._read_preferred_engine() == "wwebjs"
     status = wa_relay.status()
     assert status["preferred_engine"] == "wwebjs"
     assert status["engine"] == "wwebjs"
+
+
+def test_whatsapp_settings_route_persists_engine(client):
+    _login(client)
+
+    r = client.post("/api/whatsapp/settings", json={"engine": "wwebjs"})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["preferred_engine"] == "wwebjs"
+    assert body["engine"] == "wwebjs"
+
+
+def test_whatsapp_session_snapshot_roundtrip(tmp_path, monkeypatch):
+    from webui.backend import wa_relay
+    from webui.backend.db import get_db
+
+    monkeypatch.setenv("WEBUI_DATA_DIR", str(tmp_path))
+    db = get_db()
+    db.clear_runtime_data()
+
+    session_dir = tmp_path / "wa_session"
+    nested = session_dir / "baileys-gopay"
+    nested.mkdir(parents=True)
+    (nested / "creds.json").write_text('{"registered":true}', encoding="utf-8")
+
+    wa_relay._persist_session_snapshot()
+    assert not session_dir.exists()
+    assert db.has_runtime_key("wa_session_snapshot")
+
+    assert wa_relay._restore_session_snapshot() is True
+    assert (nested / "creds.json").read_text(encoding="utf-8") == '{"registered":true}'
+
+    wa_relay._clear_session_snapshot()
+    assert not session_dir.exists()
+    assert not db.has_runtime_key("wa_session_snapshot")
 
 
 def test_whatsapp_start_error_returns_400(client, monkeypatch):
